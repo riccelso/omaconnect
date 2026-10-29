@@ -1,0 +1,103 @@
+# Fork-only CI monitor (this file is NOT part of any PR).
+#
+# The PR branches in this fork (security/*, robustness/*, ci/*) do not all
+# carry .github/workflows/ci.yml — only ci/test-infrastructure does — so
+# pushes of the other branches trigger no workflow by themselves. This
+# workflow, living on the fork's main, checks out each PR branch in a matrix
+# and runs the repo's test conventions against it, so every PR branch has
+# real CI evidence.
+#
+# What it runs per branch (the same conventions scripts/validate.sh
+# enforces, inlined so they work on branches that predate the staged
+# validate.sh):
+#   1. python3 -m unittest discover -s tests -p 'test_*.py'
+#   2. every tests/*.test.sh
+#   3. bash -n per script (not `bash -n scripts/*.sh`, which checks only
+#      the first file)
+#   4. qmllint, verdict by findings: '^Error:' fails, warnings do not
+#      (Debian/Ubuntu qmllint builds exit 255 on warning-only output)
+#   5. shellcheck, advisory only
+#
+# The Quickshell QML runtime cannot run headless; QML gets lint only.
+
+name: Branch CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/test-infrastructure, integration/all-scopes]
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        branch:
+          - security/fail-closed-privileged-actions
+          - security/plain-text-device-strings
+          - robustness/structured-dbus-json
+          - ci/test-infrastructure
+          - integration/all-scopes
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch }}
+
+      - name: Install tools
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck qt6-declarative-dev-tools \
+            libglib2.0-bin \
+            qml6-module-qtquick qml6-module-qtquick-controls \
+            qml6-module-qtquick-layouts qml6-module-qtquick-window \
+            qml6-module-qtquick-templates
+          echo "/usr/lib/qt6/bin" >> "$GITHUB_PATH"
+
+      - name: Omarchy shell QML for import paths
+        continue-on-error: true
+        run: |
+          git clone --depth 1 https://github.com/omacom/omarchy /tmp/omarchy
+          echo "OMARCHY_SHELL_PATH=/tmp/omarchy/shell" >> "$GITHUB_ENV"
+
+      - name: Python unit tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -q
+
+      - name: Bash tests
+        run: |
+          status=0
+          for t in tests/*.test.sh; do
+            [ -e "$t" ] || continue
+            bash "$t" || status=1
+          done
+          exit "$status"
+
+      - name: Shell syntax
+        run: |
+          status=0
+          for s in scripts/*.sh; do
+            [ -e "$s" ] || continue
+            bash -n "$s" || status=1
+          done
+          exit "$status"
+
+      - name: qmllint (findings-based verdict)
+        continue-on-error: true
+        run: |
+          command -v qmllint >/dev/null 2>&1 || { echo "qmllint unavailable; skipped"; exit 0; }
+          shell="${OMARCHY_SHELL_PATH:-/usr/share/omarchy/shell}"
+          files=(Service.qml BarWidget.qml KdeConnectController.qml Panel.qml)
+          for f in components/*.qml; do files+=("$f"); done
+          out="$(mktemp)"
+          qmllint -I "$shell" -I "$shell/Ui" -I "$shell/Commons" "${files[@]}" >"$out" 2>&1 || true
+          errors=$(grep -c '^Error:' "$out" || true)
+          if [ "${errors:-0}" -gt 0 ]; then
+            grep '^Error:' "$out" | head -20
+            exit 1
+          fi
+          echo "qmllint: no errors (warnings informational)"
+
+      - name: shellcheck (advisory)
+        continue-on-error: true
+        run: shellcheck scripts/*.sh || echo "shellcheck findings (advisory)"
